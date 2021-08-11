@@ -1,0 +1,186 @@
+---
+title: "DTSE 5301: NYPD Shooting Incident Project"
+author: "ZK"
+date: "2021-07-27"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+## Introduction
+
+In this project, we use the NYPD shootings dataset to do some exploratory data analysis. In the data, we see how gun incidents have changed over time in NY, and we use that as the starting point to ask questions for further and future analysis.
+
+```{r setup-load-libs}
+knitr::opts_chunk$set(echo = TRUE)
+# let's load some libraries
+library(tidyverse) # tidying and plotting
+library(lubridate) # dates
+library(ggmap) # for mapping, see citation 
+```
+
+## Data
+
+First, we want to get our data which is provided by the city of New York. This dataset contains NYPD shootings data from the last 15 years including information regarding locations, time of day, jursidiction, perp info, and victim info. Full variable descriptions and also be found at their website: https://data.cityofnewyork.us/Public-Safety/NYPD-Shooting-Incident-Data-Historic-/833y-fsy8
+
+```{r get-data}
+# on the LaTeX output some of these strings are too long to fit on the page... sorry!
+raw_data <- read.csv("https://data.cityofnewyork.us/api/views/833y-fsy8/rows.csv?accessType=DOWNLOAD",
+                     na.strings = "")
+```
+
+Next, we want to clean our data. Looking at a subset of the data, one can see that some of the variables are the wrong format (i.e, dates). We will clean up the data by converting categorical data into factors and changing strings into dates where applicable. There are also a number of variables that or redundant or do not appear to be useful which will get dropped.
+
+```{r clean-data}
+head(raw_data) # subset of data
+
+# fixing data types
+clean_data <- raw_data %>%
+  # convert categoricla data to factors
+  mutate(across(.cols = c("BORO", "PRECINCT", "JURISDICTION_CODE", "LOCATION_DESC", 
+               "PERP_AGE_GROUP", "PERP_SEX", "PERP_RACE", "VIC_AGE_GROUP", "VIC_SEX", "VIC_RACE"), 
+               as.factor)) %>%
+  # clean up other data types
+  mutate(OCCUR_DATE = lubridate::mdy(OCCUR_DATE),
+         OCCUR_TIME = lubridate::hms(OCCUR_TIME),
+         STATISTICAL_MURDER_FLAG = as.logical(STATISTICAL_MURDER_FLAG)) %>%
+  # drop uncessary vars
+  select(-c("INCIDENT_KEY", "Lon_Lat", "X_COORD_CD", "Y_COORD_CD")) # we will use latitude and longitude if needed.
+```
+
+There are `r nrow(raw_data) - nrow(drop_na(raw_data))` rows containing missing data of some kind -- more than half the data! It seems like much of the missing data is either perp information or building information. To deal with the missing data, we will completely drop the rows that are missing PERP information instead of trying impute values. For missing location data, we will retain the missing rows and fill them with the value: "UNKNOWN". Excluding the data with missing perp data may introduce bias into our data set.
+
+```{r missing-data}
+# This probably introduces some bias.
+clean_data <- clean_data  %>% 
+  drop_na(PERP_AGE_GROUP, PERP_SEX, PERP_RACE, JURISDICTION_CODE) %>% 
+  mutate(LOCATION_DESC = ifelse(is.na(LOCATION_DESC), "UNKNOWN", LOCATION_DESC))
+```
+
+Finally, let's take a look at the summary() output for our cleaned up data.
+
+```{r data-summary}
+summary(clean_data) 
+
+```
+
+## Visualizations/Analysis
+
+<!--PROMPT: Add at least two different visualizations & some analysis to your Rmd.  Does this raise additional questions that you should investigate?  -->
+
+Now that the data has been cleaned up, we can start to exploring it and develop questions about it. First, let's plot the data by latitude, longitude and borough as a gut check on the data to make sure that it makes sense. One can easily see that the data appears to align with a map of NY and the various boroughs.
+
+```{r lat-long-plot, message=FALSE}
+# see ggmap cheat sheet:
+# https://www.nceas.ucsb.edu/sites/default/files/2020-04/ggmapCheatsheet.pdf
+
+# make bounding box
+myLocation <- c(min(clean_data$Longitude),
+                min(clean_data$Latitude),
+                max(clean_data$Longitude), 
+                max(clean_data$Latitude))
+# specify map type
+myMap <- get_map(location=myLocation,
+                 source="google",
+                 maptype="roadmap")
+# make plot
+ggmap(myMap) +
+  geom_point(aes(x=Longitude, y=Latitude, color = BORO), 
+             data = clean_data,
+             alpha = 0.25) +
+  labs(title = "NY Gunshot Incidents by Borough",
+       x = "longitude",
+       y = "latitude")
+```
+
+We will look at how volume of incidents have changed over time by looking at the monthly number of incidents and murders. In the chart below, it is clear that the overall number of gun incidents has decreased in New York over time. The negative sloping linear regression line in both cases indicates that the number of gun incidents and murders have been decreasing.
+
+```{r monthly-incidents-time-series}
+# first, let's add a variable to the data and create some summary data:
+monthly_data <- clean_data %>%
+  mutate(OCCUR_MONTH = floor_date(x = OCCUR_DATE, unit = "month")) %>%
+  group_by(OCCUR_MONTH) %>%
+  summarize(incidents = n(),
+            murders = sum(STATISTICAL_MURDER_FLAG),
+            ratio = murders / incidents)
+# plot
+monthly_data %>%
+  pivot_longer(cols = c("incidents", "murders"),
+               names_to = "type",
+               values_to = "count") %>%
+  ggplot(aes(OCCUR_MONTH, count)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE) + # let's include a linear model
+  facet_wrap(vars(type), nrow = 2,
+             scales = "free_y") +
+  labs(title = "Monthly NYPD Gun Incidents and Murders",
+       x = "Month", y = "Count",
+       caption = "NOTE: y scales are not the same")
+```
+
+Digging a little bit deeper, we can try to determine whether or not incidents have been decreasing proportionally to each other by plotting the ratio of murders to incidents over time. If they have been decreasing together, we will expect to see a relatively flat sloping regression line. Unfortunately, that is not what the plot below shows. The positively sloping regression line suggests that gun murders are becoming relatively more frequent in comparison to gun incidents as reported to NYPD.
+
+```{r monthly-murders-time-series}
+monthly_data %>%
+  ggplot(aes(OCCUR_MONTH, ratio*100)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE) +
+  labs(title = "Monthly % Murder to Incident Ratio",
+       x = "Month",
+       y = "% Murders")
+
+```
+
+Digging once again, we can ask if that relationship holds across different subsets of the city. Below the data is stratified by borough and we can see the same relationship in every borough. Though it is apparent that certain boroughs such as Brooklyn are much more dramatic than others.
+
+```{r borough-safer-over-time}
+# sorry about the big blob of dplyr and ggplot
+clean_data %>%
+  mutate(OCCUR_MONTH = floor_date(x = OCCUR_DATE, unit = "month")) %>%
+  group_by(OCCUR_MONTH, BORO) %>%
+  summarize(incidents = n(),
+            murders = sum(STATISTICAL_MURDER_FLAG),
+            ratio = murders / incidents) %>%
+  pivot_longer(cols = c("incidents", "murders", "ratio"),
+               names_to = "type",
+               values_to = "count") %>%
+  ggplot(aes(OCCUR_MONTH, count)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE) + # let's include a linear model
+  facet_grid(rows = vars(type), cols = vars(BORO),
+             scales = "free_y") +
+  labs(title = "Monthly NYPD Gun Incidents and Murders",
+       x = "Month", y = "Count",
+       caption = "NOTE: y scales are not the same")
+
+
+```
+
+This raises several other questions about our data set that might be worth exploring further to understand why lethal incidents are becoming relatively more common over time despite the overall reduciton of incidents. For example, 
+
+1. Would the effect go away if we added back in the rows of data that we removed earlier? 
+2. Do these relationships change if we stratify the data by perp or victim traits such as age?
+3. Does the time of day or day of the week have any effect on what sort of incidents are lethal?
+4. Is there an under reporting or understaffing issue in the NYPD that has caused them to ignore no-lethal gun incidents in more recent history?
+5. How will this relationship change in the future? What limitations does our linear model have as we approach 0 incidents per month?
+
+## Bias and conclusion
+
+<!--Write the conclusion to your project report and include any possible sources of bias.  Be sure to identify what your personal bias might be and how you have mitigated that.-->
+
+There are a couple of sources of bias in this project.
+
+1. __Data cleaning:__ We likely introduced bias into our data, when we dropped the data that was missing PERP data. The dropped data may have had a different distribution from the rest of our data. However, in hindsight, the analysis that we performed did not actually uses the variables that we were missing data is, so we could have included all of the observations and mitigated this issue.
+2. __Personal bias:__ My personal bias manifests itself in the form of problem selection. I am sure that there are many interesting ways to look at and analyze this data, but I decided to focus on discrepancy between decreasing incident rates alongside rising lethal cases.
+
+Exploring this dataset gives us some insight into the nature of shooting incidents in New York over the last 15 years. Our analysis raises questions regarding the relationship between lethal and non-lethal incidents and how the relationship varies over time and across different subsets of the data.  
+
+## Citations
+
+D. Kahle and H. Wickham. ggmap: Spatial Visualization with ggplot2. The R Journal, 5(1), 144-161. URL
+http://journal.r-project.org/archive/2013-1/kahle-wickham.pdf
+
+
+```{r session-info}
+sessionInfo()
+```
