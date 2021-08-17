@@ -1,0 +1,258 @@
+---
+title: 'DTSA 5301: COVID Data'
+author: "ZK"
+date: "8/11/2021"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r load-libs}
+library(tidyverse)
+library(lubridate)
+```
+
+
+# Data
+
+For this, we use the Johns Hopkins COVID data that is publically available on Github.
+
+```{r import-data, message = F}
+url_base <- "https://raw.githubusercontent.com/CSSEGISandData/COVID-19/master/csse_covid_19_data/csse_covid_19_time_series/"
+
+file_names <- c("time_series_covid19_confirmed_US.csv",
+                "time_series_covid19_confirmed_global.csv",
+                "time_series_covid19_deaths_US.csv",
+                "time_series_covid19_deaths_global.csv")
+urls <- str_c( url_base, file_names)
+confirmed_us <- read_csv(urls[1])
+confirmed_global <- read_csv(urls[2])
+deaths_us <- read_csv(urls[3])
+deaths_global <- read_csv(urls[4])
+
+
+# we can look at the data:
+head(confirmed_us)[1:12]
+
+```
+
+The data is in a WIDE format, so we will need to tidy it up. I am only going to use the __US__ data, so I will not tidy the global datasets.
+
+```{r tidy-data}
+# vars we don't want
+vars_to_drop <- c("UID", "iso2", "iso3", "code3", "FIPS", "Admin2")
+# vars to keep along with the numeric data
+vars_not_to_pivot <- c("Province_State", "Country_Region", "Lat", "Long_", "Combined_Key")
+
+# make them long
+long_death_us <- deaths_us %>%
+  select(-vars_to_drop) %>%
+  pivot_longer(cols = -c(vars_not_to_pivot, "Population"), values_to = "deaths", names_to = "date")
+  
+long_confirmed_us <- confirmed_us %>%
+  select(-vars_to_drop) %>%
+  pivot_longer(cols = -(vars_not_to_pivot), values_to = "confirmed", names_to = "date")
+
+df_tidy <- full_join(long_confirmed_us, long_death_us)
+
+head(df_tidy)
+```
+Now that we have tidied our data, let's deal with missing data.
+
+```{r missing-data}
+summary(df_tidy) # there are several rows of missing data, but it appears to
+# be consistent acroos confirmed, population and deaths. Perhaps from reporting
+# issues? i.e. weekends? We will simply drop the data.
+df_tidy <- df_tidy %>% drop_na()
+
+
+```
+
+
+ Finally, we will clean up some of the variables and do some feature engineering.
+
+```{r feature-enigneering}
+
+head(df_tidy)
+
+df <-df_tidy %>%
+  mutate(date = floor_date(mdy(date), unit = "day")) %>%
+  # group and summarize by state
+  group_by(Province_State, date) %>%
+  summarize(Population = sum(Population),
+            confirmed = sum(confirmed),
+            deaths = sum(deaths)) %>%
+  # add some features
+  mutate(week_start = floor_date(date, unit = "week"), # not sure if we will use this
+         pct_deaths = deaths / Population, # note that deaths is cumulative
+         pct_confirmed = confirmed / Population, # note confirmed is cumulative
+         #  we try to extract an approximation of active cases using the 14 day
+         # guideline provided by the CDC as an "active period"
+         active = (confirmed - lag(confirmed, 14)) - (deaths - lag(deaths, 14)),
+         pct_active = active / Population, # active is NOT cumulative (for 
+         # reasons that I hope are obvious!)
+         pct_change_deaths = deaths / lag(deaths) - 1,
+         pct_change_confirmed = confirmed / lag(confirmed) - 1,
+         pct_change_active = active / lag(active) - 1)
+
+```
+
+
+# Exploratory Analysis
+
+First, let's look at active cases against time. In the chart below, we can see a massive spike in active cases towards the end of 2020, and another large spike that is current in the summer of 2021.
+
+```{r active-cases-ts}
+df %>% 
+  group_by(date) %>%
+  # let's generalize accross the country
+  summarize(deaths = sum(deaths), 
+            confirmed = sum(confirmed),
+            active = sum(active)) %>%
+  drop_na() %>%
+  ggplot(aes(x = date, y = active / 1000, color = "active cases")) +
+  geom_line() +
+  geom_line(aes(y = deaths/1000, color = "total deaths")) +
+  labs(title = "US total daily active COVID cases",
+       x = "date",
+       y = "'000's of cases")
+# for the technical anaslysts of the stock market among the class
+# this appears to be a classic "head and shoulders" signal...
+# sorry to make light of a morbid matter.
+  
+```
+
+Is the number of active cases correlated to the number of deaths? We will plot the daily percent changes against each other. Looking at the chart below, we can see that something is not qutie right.
+
+```{r pct-change-scatter}
+# let's make a new data frame
+df_changes <- df %>% 
+  group_by(date) %>%
+  summarize(deaths = sum(deaths), 
+            confirmed = sum(confirmed),
+            active = sum(active)) %>%
+  mutate(pct_change_deaths = deaths/lag(deaths) - 1,
+         pct_change_active = active / lag(active) - 1) %>%
+  drop_na()
+
+df_changes %>%
+  ggplot(aes(x = pct_change_active*100, y = pct_change_deaths*100)) +
+  geom_point( alpha = 0.5) +
+  # geom_line(aes(y = total_deaths/1000, color = "total deaths")) +
+  labs(title = "% change in active cases vs % change in deaths",
+       x = "% change active cases",
+       y = "% change deaths")
+
+```
+
+So we apply a log-log transform, and that helps normalize the data. In the chart below, we can see a linear relationship between the two variables once they have been transformed.
+
+
+```{r pct-change-scatter-log, warning = F}
+df_changes %>%
+  ggplot(aes(x = pct_change_active*100, y = pct_change_deaths*100)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "lm") +
+  # let's log transform to try and normalize
+  scale_y_log10() +
+  scale_x_log10() +
+  labs(title = "% change in active cases vs % change in deaths",
+       subtitle = "with log-log transform applied",
+       x = "% change active cases",
+       y = "% change deaths")
+```
+
+# Modelling
+
+We can model this effect via linear regression. We can see from the model below that percent change in active cases appears to have an effect and a positive correlation to percent change in deaths. That means that as more active cases occur, we can expect more deaths to occur which should not be suprising!
+```{r pct-change-linear-model, warning = F}
+df_changes_log <- df_changes %>%
+  mutate(pct_change_deaths = log(pct_change_deaths*100),
+         pct_change_active = log(pct_change_active*100))
+# there is probably a better way to do this next bit, but I pulled
+# this code off the internet as-is: https://newbedev.com/how-to-remove-rows-with-inf-from-a-dataframe-in-r
+# removes NaN and Inf row
+df_changes_log <- df_changes_log[Reduce(`&`, 
+                                       lapply(df_changes_log, 
+                                              function(x) !is.na(x)  & is.finite(x))),]
+
+fit_pct_change <- lm(pct_change_deaths ~ pct_change_active, 
+                     data = df_changes_log)
+
+# here is the model
+summary(fit_pct_change)
+```
+
+To take this one step further, let's look try adding a 14-day lag to the active cases % change. This way we can check to see whether an increase in active cases suggest more upcoming deaths. We make the same plot and run the same model as before, but with the 14-day lag.
+
+```{r pct-change-scatter-log-14d-lag, warning = F}
+df_changes %>%
+  mutate(pct_change_active = lag(pct_change_active, 14)) %>%
+  ggplot(aes(x = pct_change_active*100, y = pct_change_deaths*100)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "lm") +
+  # let's log transform to try and normalize
+  scale_y_log10() +
+  scale_x_log10() +
+  labs(title = "14 day lagged % change in active cases vs % change in deaths",
+       subtitle = "with log-log transform applied",
+       x = "14 day lagged % change active cases",
+       y = "% change deaths")
+```
+
+
+
+```{r pct-change-linear-model-14d-lag, warning = F}
+df_changes_log <- df_changes %>%
+  mutate(pct_change_deaths = log(pct_change_deaths*100),
+         pct_change_active = log(pct_change_active*100),
+         pct_change_active = lag(pct_change_active, 14))
+# there is probably a better way to do this next bit, but I pulled
+# this code off the internet as-is: https://newbedev.com/how-to-remove-rows-with-inf-from-a-dataframe-in-r
+# removes NaN and Inf row
+df_changes_log <- df_changes_log[Reduce(`&`, 
+                                       lapply(df_changes_log, 
+                                              function(x) !is.na(x)  & is.finite(x))),]
+
+fit_pct_change_14d_lag <- lm(pct_change_deaths ~ pct_change_active, 
+                     data = df_changes_log)
+
+# here is the model
+summary(fit_pct_change_14d_lag)
+```
+
+As a comparison, we normalize the coefficient and we find that the results are not too different.
+
+```{r normalized-coefficients}
+cat("0-day lag model\n")
+# normalizing the coefficients we get:
+exp(fit_pct_change$coefficients)
+
+cat("\n\n14-day lag model\n")
+# normalizing the coefficients we get:
+exp(fit_pct_change_14d_lag$coefficients)
+```
+
+# Bias
+
+There are a number of ways that bias could be present in this analysis:
+
+1. __Data Collection:__ The data the John Hopkins provides is aggregated from several different sources. It is very likely that the quality, accuracy, and timeliness of the data varies depending on the source.
+2. __Reporting Issues:__ COVID in may places has been inconsistently reported. In some instances COVID is identified along with comorbidities, and in other places the opposite is reported, and further there are surely cases that are misreported or not reported at all.
+3. __Data transformation issues:__ When we performed the log transforms of the data, several NaN and Inf values arose. It is quite possible that there is a non-random pattern to those instances and that could skew the results of our analysis.
+
+
+# Conclusion, Further Analysis
+
+In this analysis we looked at US COVID data over time and attempted to explore some of the relationships between active cases and subsequent deaths. Furhter analysis could go in many different directions and ask questions such as:
+
+1. Do these relationships hold across different slices of time or regions?
+2. Can we add in external data such as weather data that helps explain the various spikes in COVID?
+3. Can we use the location and city level data to understand how COVID traverses the country and spreads?
+
+There are many more questions that could be asked, examining these relationships has helped me gain a little bit of insight into the pandemic.
+
+
+```{r session-info}
+sessionInfo()
+```
